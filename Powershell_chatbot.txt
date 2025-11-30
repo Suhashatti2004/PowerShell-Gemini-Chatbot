@@ -1,0 +1,239 @@
+# gemini-chat.ps1
+# PowerShell Gemini chat (save & run as a file). Supports files, clipboard, chunking, interactive & batch modes.
+# Put your API key here or set it in your environment before running.
+$env:API_KEY = "YOUR_REAL_KEY_HERE"
+
+if (-not $env:API_KEY -or $env:API_KEY.Trim() -eq "") {
+    Write-Host "API key not found." -ForegroundColor Yellow
+    Write-Host "Edit this file and put your key inside the quotes above or set the environment variable." -ForegroundColor Cyan
+    exit
+}
+
+$MODEL_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+$KEEP_LAST = 20                    # keep last N messages in memory
+$MAX_CHARS_PER_REQUEST = 120000    # safe per-request character limit (heuristic)
+$SLEEP_MS_BETWEEN_CHUNKS = 300     # pause between chunk sends when interactive
+
+Write-Host ""
+Write-Host "Gemini Chat Ready — type your question and press Enter." -ForegroundColor Green
+Write-Host "Commands:" -ForegroundColor Green
+Write-Host "  /file <path>       - send file contents (interactive: assistant replies per chunk)" -ForegroundColor Green
+Write-Host "  /clip              - send clipboard contents (interactive)" -ForegroundColor Green
+Write-Host "  /batchfile <path>  - upload file chunks, then assistant replies once (batch mode)" -ForegroundColor Green
+Write-Host "  /batchclip         - upload clipboard, then assistant replies once (batch mode)" -ForegroundColor Green
+Write-Host "  EXIT               - quit" -ForegroundColor Green
+Write-Host ""
+
+# Use global variable so functions see it consistently
+$global:conversation = @()
+
+function Ensure-Conversation {
+    if (-not $global:conversation) { $global:conversation = @() }
+}
+
+function Add-To-History {
+    param([string]$text, [string]$role = "user")
+    Ensure-Conversation
+    $global:conversation += @{ role = $role; parts = @(@{ text = $text }) }
+    if ($global:conversation.Count -gt $KEEP_LAST) {
+        $global:conversation = $global:conversation[-$KEEP_LAST..-1]
+    }
+}
+
+function Call-Gemini {
+    Ensure-Conversation
+
+    # The API requires "contents" to be present and non-empty; protect against accidental empty calls.
+    if (-not $global:conversation -or $global:conversation.Count -eq 0) {
+        Write-Host "No conversation content to send. Add a message first." -ForegroundColor Yellow
+        return $null
+    }
+
+    # Build request body
+    $bodyObj = @{ contents = $global:conversation }
+    $body = $bodyObj | ConvertTo-Json -Depth 60 -Compress
+
+    try {
+        $response = Invoke-RestMethod -Uri $MODEL_URL `
+            -Method Post `
+            -Headers @{ "x-goog-api-key" = $env:API_KEY; "Content-Type" = "application/json" } `
+            -Body $body -ErrorAction Stop
+
+        $textOut = $null
+        if ($response -and $response.candidates -and $response.candidates.Count -gt 0) {
+            $candidate = $response.candidates[0]
+            if ($candidate.content -and $candidate.content.parts -and $candidate.content.parts.Count -gt 0) {
+                $textOut = $candidate.content.parts[0].text
+            }
+        }
+        return $textOut
+    } catch {
+        Write-Host "`nRequest failed:" -ForegroundColor Red
+        if ($_.Exception -and $_.Exception.Response) {
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $bodyText = $reader.ReadToEnd()
+                Write-Host $bodyText -ForegroundColor Red
+            } catch {
+                Write-Host $_.Exception.Message -ForegroundColor Red
+            }
+        } else {
+            $_ | Format-List * -Force
+        }
+        return $null
+    }
+}
+
+function Send-And-Receive {
+    param([string]$text)
+    Add-To-History -text $text -role "user"
+    $reply = Call-Gemini
+    if ($reply) {
+        Write-Host "`nAssistant:" -ForegroundColor Cyan
+        Write-Host $reply -ForegroundColor White
+        Write-Host ""
+        Add-To-History -text $reply -role "model"
+    } else {
+        Write-Host "`n(No text found in response)`n" -ForegroundColor Yellow
+    }
+}
+
+function Send-LongText-Interactive {
+    param([string]$fullText)
+
+    if ($fullText.Length -le $MAX_CHARS_PER_REQUEST) {
+        Send-And-Receive -text $fullText
+    } else {
+        $chunks = @()
+        $pos = 0
+        while ($pos -lt $fullText.Length) {
+            $remaining = $fullText.Length - $pos
+            $len = [math]::Min($MAX_CHARS_PER_REQUEST, $remaining)
+            $substr = $fullText.Substring($pos, $len)
+            $lastNewline = $substr.LastIndexOf("`n")
+            if ($lastNewline -gt 0 -and $lastNewline -lt $len - 200) {
+                $len = $lastNewline + 1
+            }
+            $chunks += $fullText.Substring($pos, $len)
+            $pos += $len
+        }
+
+        $count = $chunks.Count
+        for ($i = 0; $i -lt $count; $i++) {
+            $label = "[PART $([int]($i+1))/$count]`n"
+            $toSend = $label + $chunks[$i]
+            Write-Host "Sending chunk $($i+1)/$count (length $($toSend.Length))..." -ForegroundColor DarkYellow
+            Send-And-Receive -text $toSend
+            Start-Sleep -Milliseconds $SLEEP_MS_BETWEEN_CHUNKS
+        }
+    }
+}
+
+function Send-LongText-Batch {
+    param([string]$fullText)
+
+    if ($fullText.Length -le $MAX_CHARS_PER_REQUEST) {
+        Add-To-History -text $fullText -role "user"
+    } else {
+        $chunks = @()
+        $pos = 0
+        while ($pos -lt $fullText.Length) {
+            $remaining = $fullText.Length - $pos
+            $len = [math]::Min($MAX_CHARS_PER_REQUEST, $remaining)
+            $substr = $fullText.Substring($pos, $len)
+            $lastNewline = $substr.LastIndexOf("`n")
+            if ($lastNewline -gt 0 -and $lastNewline -lt $len - 200) {
+                $len = $lastNewline + 1
+            }
+            $chunks += $fullText.Substring($pos, $len)
+            $pos += $len
+        }
+
+        $count = $chunks.Count
+        for ($i = 0; $i -lt $count; $i++) {
+            $label = "[BATCH_PART $([int]($i+1))/$count]`n"
+            $toAdd = $label + $chunks[$i]
+            Write-Host "Adding batch chunk $($i+1)/$count (length $($toAdd.Length))..." -ForegroundColor DarkYellow
+            Add-To-History -text $toAdd -role "user"
+        }
+    }
+
+    Write-Host "All parts uploaded — requesting assistant reply..." -ForegroundColor DarkGreen
+    $reply = Call-Gemini
+    if ($reply) {
+        Write-Host "`nAssistant:" -ForegroundColor Cyan
+        Write-Host $reply -ForegroundColor White
+        Write-Host ""
+        Add-To-History -text $reply -role "model"
+    } else {
+        Write-Host "`n(No text found in response)`n" -ForegroundColor Yellow
+    }
+}
+
+# Main loop
+while ($true) {
+    $input = Read-Host -Prompt "You"
+    if ($input -eq $null) { continue }
+    $trim = $input.Trim()
+    if ($trim.ToUpper() -eq "EXIT") { break }
+    if ($trim -eq "") { continue }
+
+    if ($trim.StartsWith("/file ")) {
+        $path = $trim.Substring(6).Trim()
+        if (-not (Test-Path $path)) {
+            Write-Host "File not found: $path" -ForegroundColor Yellow
+            continue
+        }
+        try {
+            $content = Get-Content $path -Raw -ErrorAction Stop
+            Send-LongText-Interactive -fullText $content
+        } catch {
+            Write-Host "Failed to read file: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        continue
+    } elseif ($trim -eq "/clip") {
+        try {
+            $clip = Get-Clipboard -TextFormatType Text
+            if (-not $clip) {
+                Write-Host "Clipboard is empty or not text." -ForegroundColor Yellow
+                continue
+            }
+            Send-LongText-Interactive -fullText $clip
+        } catch {
+            Write-Host "Failed to get clipboard: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        continue
+    } elseif ($trim.StartsWith("/batchfile ")) {
+        $path = $trim.Substring(10).Trim()
+        if (-not (Test-Path $path)) {
+            Write-Host "File not found: $path" -ForegroundColor Yellow
+            continue
+        }
+        try {
+            $content = Get-Content $path -Raw -ErrorAction Stop
+            Send-LongText-Batch -fullText $content
+        } catch {
+            Write-Host "Failed to read file: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        continue
+    } elseif ($trim -eq "/batchclip") {
+        try {
+            $clip = Get-Clipboard -TextFormatType Text
+            if (-not $clip) {
+                Write-Host "Clipboard is empty or not text." -ForegroundColor Yellow
+                continue
+            }
+            Send-LongText-Batch -fullText $clip
+        } catch {
+            Write-Host "Failed to get clipboard: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        continue
+    } else {
+        # normal single-line send (still chunked if long)
+        Send-LongText-Interactive -fullText $input
+    }
+}
+
+Write-Host ""
+Write-Host "Goodbye!" -ForegroundColor Cyan
